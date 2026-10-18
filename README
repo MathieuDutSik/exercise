@@ -34,16 +34,20 @@ Design choices
 
 1. Amounts are integers
 
-   An amount is a u64 holding a number of ten-thousandths: 1.5 is stored as
+   An amount is an i64 holding a number of ten-thousandths: 1.5 is stored as
    15000. Arithmetic is exact, so there are no floating point rounding
-   errors. Every addition and subtraction is checked: an overflow or a
-   negative result is an error instead of a wrapped value. A u64 holds up to
-   about 1.8e15 units, far beyond any realistic balance.
+   errors. Every addition and subtraction is checked: an overflow is an
+   error instead of a wrapped value. An i64 holds about +/-9.2e14 units, far
+   beyond any realistic balance.
+
+   The amount is signed because the available funds of a client can be
+   negative (see 5). Amounts read from the input, however, are never
+   negative.
 
    Parsing is strict. It accepts "2", "2.", "2.5" and ".5" and rejects
    negative values, signs, exponents, separators, more than four decimals and
    values that do not fit. Output drops trailing zeros, so 1.5000 is written
-   "1.5" and 2.0000 is written "2".
+   "1.5", 2.0000 is written "2" and -0.5000 is written "-0.5".
 
 2. Every transaction is all or nothing
 
@@ -56,9 +60,11 @@ Design choices
 3. The total is derived, never stored
 
    An account stores only available, held and locked. The total is computed
-   as available + held, so the three values can never disagree. A deposit is
-   accepted only if the new total fits in a u64; no other operation increases
-   the total, so computing it can never overflow.
+   as available + held, so the three values can never disagree. Held is
+   never negative. A deposit is accepted only if the new total fits in an
+   i64, a dispute only if the new available and held both fit; no other
+   operation can take the total out of range, so computing it never
+   overflows.
 
 4. Only deposits are kept in memory, and only while disputable
 
@@ -72,8 +78,17 @@ Design choices
 
    - The referenced transaction must be a tracked deposit of the same client.
      A reference to a deposit of another client is treated as unknown.
-   - A dispute is rejected if the deposited funds were already withdrawn,
-     since holding them would make the available funds negative.
+   - A dispute is accepted even if the deposited funds were already
+     withdrawn. The available funds then become negative: the client is in
+     debt. For example a deposit of 10, a withdrawal of 10 and a dispute of
+     the deposit give available -10, held 10, total 0. Collecting the debt
+     is out of scope of this engine.
+   - A client whose available funds are negative cannot withdraw anything.
+     More generally, a withdrawal is accepted only if the available funds
+     stay non-negative. Deposits are still accepted and reduce the debt.
+   - A resolve releases the held funds back to available, clearing the debt
+     in the example above. A chargeback removes them, so the debt remains:
+     available -10, held 0, total -10, account locked.
    - A dispute of a deposit already under dispute is rejected.
    - A resolve or a chargeback of a deposit that is not under dispute is
      rejected.

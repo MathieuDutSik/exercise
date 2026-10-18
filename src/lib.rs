@@ -152,6 +152,20 @@ dispute,1,1,
     }
 
     #[test]
+    fn dispute_after_withdrawal_gives_negative_funds() {
+        let input = "type,client,tx,amount
+deposit,1,1,10
+withdrawal,1,2,10
+dispute,1,1,
+withdrawal,1,3,0.0001
+";
+        assert_eq!(
+            run_str(input),
+            "client,available,held,total,locked\n1,-10,10,0,false\n"
+        );
+    }
+
+    #[test]
     fn invalid_rows_are_skipped() {
         let input = "type,client,tx,amount
 deposit,1,1,1

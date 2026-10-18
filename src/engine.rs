@@ -48,9 +48,10 @@ pub enum TxError {
     AccountLocked,
     /// A deposit reuses the id of a deposit that is still tracked.
     DuplicateTx,
-    /// A withdrawal, or a dispute, needs more than the available funds.
+    /// A withdrawal needs more than the available funds, or the available
+    /// funds are negative.
     InsufficientFunds,
-    /// The account balance would exceed the representable maximum.
+    /// A balance would go beyond the representable range.
     Overflow,
     /// The referenced deposit does not exist (anymore) for this client.
     UnknownTx,
@@ -78,7 +79,9 @@ impl fmt::Display for TxError {
 impl std::error::Error for TxError {}
 
 /// The balances of one client. `total` is derived as `available + held`,
-/// so the three values can never disagree.
+/// so the three values can never disagree. `held` is never negative, but
+/// `available` (and so `total`) is when a deposit already withdrawn is
+/// disputed: the client is then in debt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Account {
     pub available: Amount,
@@ -88,7 +91,9 @@ pub struct Account {
 
 impl Account {
     /// `available + held`. Cannot overflow: deposits are only accepted when
-    /// the new total fits, and the other operations never increase it.
+    /// the new total fits, disputes and resolves leave it unchanged, and
+    /// withdrawals and chargebacks only lower it to `available + held` with
+    /// `held >= 0`.
     pub fn total(&self) -> Amount {
         self.available
             .checked_add(self.held)
@@ -178,9 +183,11 @@ impl Engine {
         if account.locked {
             return Err(TxError::AccountLocked);
         }
+        // Funds must remain non-negative: a client in debt cannot withdraw.
         account.available = account
             .available
             .checked_sub(amount)
+            .filter(|available| !available.is_negative())
             .ok_or(TxError::InsufficientFunds)?;
         Ok(())
     }
@@ -190,18 +197,15 @@ impl Engine {
         if deposit.disputed {
             return Err(TxError::AlreadyDisputed);
         }
-        // If the deposited funds were already withdrawn, holding them would
-        // make the available balance negative: the dispute is rejected.
-        let available = account
-            .available
-            .checked_sub(deposit.amount)
-            .ok_or(TxError::InsufficientFunds)?;
+        // If the deposited funds were already withdrawn, the available
+        // funds become negative: the client is in debt.
+        let available = account.available.checked_sub(deposit.amount);
+        let held = account.held.checked_add(deposit.amount);
+        let (Some(available), Some(held)) = (available, held) else {
+            return Err(TxError::Overflow);
+        };
         account.available = available;
-        // `available + held` is unchanged, so `held` cannot overflow.
-        account.held = account
-            .held
-            .checked_add(deposit.amount)
-            .expect("total is unchanged");
+        account.held = held;
         deposit.disputed = true;
         Ok(())
     }
@@ -414,7 +418,7 @@ mod tests {
         let mut engine = engine_with(&[Deposit {
             client: 1,
             tx: 1,
-            amount: Amount::from_raw(u64::MAX),
+            amount: Amount::from_raw(i64::MAX),
         }]);
         let tx = Deposit {
             client: 1,
@@ -431,7 +435,7 @@ mod tests {
             Deposit {
                 client: 1,
                 tx: 1,
-                amount: Amount::from_raw(u64::MAX - 1),
+                amount: Amount::from_raw(i64::MAX - 1),
             },
             Dispute { client: 1, tx: 1 },
         ]);
@@ -597,12 +601,126 @@ mod tests {
             Dispute { client: 1, tx: 1 },
             TxError::AlreadyDisputed,
         );
-        // Funds already withdrawn: 1 available, 5 disputed.
-        assert_rejected(
-            &mut engine,
-            Dispute { client: 2, tx: 2 },
-            TxError::InsufficientFunds,
-        );
+    }
+
+    #[test]
+    fn dispute_of_withdrawn_funds_puts_client_in_debt() {
+        let mut engine = engine_with(&[
+            Deposit {
+                client: 1,
+                tx: 1,
+                amount: amt("10"),
+            },
+            Withdrawal {
+                client: 1,
+                tx: 2,
+                amount: amt("10"),
+            },
+            Dispute { client: 1, tx: 1 },
+        ]);
+        assert_eq!(balances(&engine, 1), b("-10", "10", "0", false));
+        // A client in debt cannot withdraw anything, not even zero.
+        for amount in ["0", "1"] {
+            let tx = Withdrawal {
+                client: 1,
+                tx: 3,
+                amount: amt(amount),
+            };
+            assert_rejected(&mut engine, tx, TxError::InsufficientFunds);
+        }
+        // Deposits still go through, and lower the debt.
+        let deposit = Deposit {
+            client: 1,
+            tx: 4,
+            amount: amt("4"),
+        };
+        engine.apply(deposit).unwrap();
+        assert_eq!(balances(&engine, 1), b("-6", "10", "4", false));
+        let tx = Withdrawal {
+            client: 1,
+            tx: 5,
+            amount: amt("0"),
+        };
+        assert_rejected(&mut engine, tx, TxError::InsufficientFunds);
+    }
+
+    #[test]
+    fn debt_is_cleared_by_resolve_or_kept_by_chargeback() {
+        let in_debt = [
+            Deposit {
+                client: 1,
+                tx: 1,
+                amount: amt("10"),
+            },
+            Withdrawal {
+                client: 1,
+                tx: 2,
+                amount: amt("7.5"),
+            },
+            Dispute { client: 1, tx: 1 },
+        ];
+        let mut engine = engine_with(&in_debt);
+        engine.apply(Resolve { client: 1, tx: 1 }).unwrap();
+        assert_eq!(balances(&engine, 1), b("2.5", "0", "2.5", false));
+        let mut engine = engine_with(&in_debt);
+        engine.apply(Chargeback { client: 1, tx: 1 }).unwrap();
+        assert_eq!(balances(&engine, 1), b("-7.5", "0", "-7.5", true));
+    }
+
+    #[test]
+    fn dispute_overflowing_available_is_rejected() {
+        // Two deposits of the maximum, both withdrawn: disputing the second
+        // would take the available funds below the minimum.
+        let max = Amount::from_raw(i64::MAX);
+        let mut engine = engine_with(&[
+            Deposit {
+                client: 1,
+                tx: 1,
+                amount: max,
+            },
+            Withdrawal {
+                client: 1,
+                tx: 2,
+                amount: max,
+            },
+            Deposit {
+                client: 1,
+                tx: 3,
+                amount: max,
+            },
+            Withdrawal {
+                client: 1,
+                tx: 4,
+                amount: max,
+            },
+            Dispute { client: 1, tx: 1 },
+        ]);
+        assert_rejected(&mut engine, Dispute { client: 1, tx: 3 }, TxError::Overflow);
+    }
+
+    #[test]
+    fn dispute_overflowing_held_is_rejected() {
+        // The maximum is held: disputing one more unit would overflow `held`
+        // even though `available` would fit.
+        let mut engine = engine_with(&[
+            Deposit {
+                client: 1,
+                tx: 1,
+                amount: Amount::from_raw(i64::MAX),
+            },
+            Withdrawal {
+                client: 1,
+                tx: 2,
+                amount: Amount::from_raw(1),
+            },
+            Deposit {
+                client: 1,
+                tx: 3,
+                amount: Amount::from_raw(1),
+            },
+            Dispute { client: 1, tx: 1 },
+        ]);
+        assert_rejected(&mut engine, Dispute { client: 1, tx: 3 }, TxError::Overflow);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Fixed-point monetary amount with four decimal places.
 //!
-//! Amounts are stored as an integer number of ten-thousandths (`1.5` is
-//! stored as `15000`), so arithmetic is exact and never suffers from
-//! floating point rounding. All arithmetic is checked: an overflow or an
-//! underflow yields `None` instead of wrapping.
+//! Amounts are stored as a signed integer number of ten-thousandths (`1.5`
+//! is stored as `15000`), so arithmetic is exact and never suffers from
+//! floating point rounding. An amount can be negative: the available funds
+//! of a client go below zero when a deposit already withdrawn is disputed.
+//! All arithmetic is checked: an overflow yields `None` instead of wrapping.
 
 use std::fmt;
 use std::str::FromStr;
@@ -11,10 +12,10 @@ use std::str::FromStr;
 /// Number of decimal places kept.
 const DECIMALS: usize = 4;
 /// `10^DECIMALS`: the integer value of one unit.
-const SCALE: u64 = 10_000;
+const SCALE: i64 = 10_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Amount(u64);
+pub struct Amount(i64);
 
 /// Reason an amount string was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +33,12 @@ impl Amount {
     pub const ZERO: Amount = Amount(0);
 
     /// Builds an amount from a raw number of ten-thousandths.
-    pub const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: i64) -> Self {
         Amount(raw)
+    }
+
+    pub fn is_negative(self) -> bool {
+        self.0 < 0
     }
 
     pub fn checked_add(self, other: Amount) -> Option<Amount> {
@@ -49,7 +54,8 @@ impl FromStr for Amount {
     type Err = ParseAmountError;
 
     /// Parses a non-negative decimal with at most four fractional digits,
-    /// e.g. `"2"`, `"2."`, `"0.1234"` or `".5"`.
+    /// e.g. `"2"`, `"2."`, `"0.1234"` or `".5"`. Transactions always carry
+    /// non-negative amounts, so a sign is rejected.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseAmountError(s.to_owned());
         let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
@@ -62,15 +68,15 @@ impl FromStr for Amount {
             return Err(err());
         }
         // Both parts are now plain digit strings (possibly empty).
-        let int: u64 = if int_part.is_empty() {
+        let int: i64 = if int_part.is_empty() {
             0
         } else {
             int_part.parse().map_err(|_| err())?
         };
-        let mut frac: u64 = 0;
+        let mut frac: i64 = 0;
         for i in 0..DECIMALS {
             let digit = frac_part.as_bytes().get(i).map_or(0, |b| b - b'0');
-            frac = frac * 10 + u64::from(digit);
+            frac = frac * 10 + i64::from(digit);
         }
         int.checked_mul(SCALE)
             .and_then(|v| v.checked_add(frac))
@@ -81,15 +87,20 @@ impl FromStr for Amount {
 
 impl fmt::Display for Amount {
     /// Writes the amount with trailing fractional zeros removed:
-    /// `1.5000` is written `1.5` and `2.0000` is written `2`.
+    /// `1.5000` is written `1.5`, `2.0000` is written `2` and `-0.5000` is
+    /// written `-0.5`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let int = self.0 / SCALE;
-        let frac = self.0 % SCALE;
+        // The absolute value always fits in a u64, even for i64::MIN.
+        let sign = if self.is_negative() { "-" } else { "" };
+        let abs = self.0.unsigned_abs();
+        let scale = SCALE.unsigned_abs();
+        let int = abs / scale;
+        let frac = abs % scale;
         if frac == 0 {
-            return write!(f, "{int}");
+            return write!(f, "{sign}{int}");
         }
         let digits = format!("{frac:0DECIMALS$}");
-        write!(f, "{int}.{}", digits.trim_end_matches('0'))
+        write!(f, "{sign}{int}.{}", digits.trim_end_matches('0'))
     }
 }
 
@@ -97,7 +108,7 @@ impl fmt::Display for Amount {
 mod tests {
     use super::*;
 
-    fn parse(s: &str) -> Result<u64, ParseAmountError> {
+    fn parse(s: &str) -> Result<i64, ParseAmountError> {
         s.parse::<Amount>().map(|a| a.0)
     }
 
@@ -116,8 +127,8 @@ mod tests {
 
     #[test]
     fn parses_largest_amount() {
-        let max = format!("{}.{}", u64::MAX / SCALE, u64::MAX % SCALE);
-        assert_eq!(parse(&max), Ok(u64::MAX));
+        let max = format!("{}.{}", i64::MAX / SCALE, i64::MAX % SCALE);
+        assert_eq!(parse(&max), Ok(i64::MAX));
     }
 
     #[test]
@@ -131,12 +142,12 @@ mod tests {
 
     #[test]
     fn rejects_overflowing_amounts() {
-        // Integer part does not fit in u64 at all.
+        // Integer part does not fit in i64 at all.
         assert!(parse("99999999999999999999999").is_err());
-        // Integer part fits in u64 but not once scaled.
-        assert!(parse(&format!("{}", u64::MAX / SCALE + 1)).is_err());
+        // Integer part fits in i64 but not once scaled.
+        assert!(parse(&format!("{}", i64::MAX / SCALE + 1)).is_err());
         // Scaled integer part fits but adding the fraction overflows.
-        let just_over = format!("{}.9999", u64::MAX / SCALE);
+        let just_over = format!("{}.9999", i64::MAX / SCALE);
         assert!(parse(&just_over).is_err());
     }
 
@@ -151,8 +162,17 @@ mod tests {
     }
 
     #[test]
+    fn displays_negative_amounts() {
+        assert_eq!(Amount(-10_000).to_string(), "-1");
+        assert_eq!(Amount(-15_000).to_string(), "-1.5");
+        assert_eq!(Amount(-5_000).to_string(), "-0.5");
+        assert_eq!(Amount(-1).to_string(), "-0.0001");
+        assert_eq!(Amount(i64::MIN).to_string(), "-922337203685477.5808");
+    }
+
+    #[test]
     fn display_round_trips() {
-        for raw in [0, 1, 9_999, 10_000, 10_010, 1_234_567, u64::MAX] {
+        for raw in [0, 1, 9_999, 10_000, 10_010, 1_234_567, i64::MAX] {
             let a = Amount(raw);
             assert_eq!(a.to_string().parse::<Amount>(), Ok(a));
         }
@@ -162,9 +182,17 @@ mod tests {
     fn checked_arithmetic() {
         let one = Amount::from_raw(1);
         assert_eq!(one.checked_add(one), Some(Amount(2)));
-        assert_eq!(Amount(u64::MAX).checked_add(one), None);
+        assert_eq!(Amount(i64::MAX).checked_add(one), None);
         assert_eq!(one.checked_sub(one), Some(Amount::ZERO));
-        assert_eq!(Amount::ZERO.checked_sub(one), None);
+        assert_eq!(Amount::ZERO.checked_sub(one), Some(Amount(-1)));
+        assert_eq!(Amount(i64::MIN).checked_sub(one), None);
+    }
+
+    #[test]
+    fn sign() {
+        assert!(Amount(-1).is_negative());
+        assert!(!Amount::ZERO.is_negative());
+        assert!(!Amount(1).is_negative());
     }
 
     #[test]
