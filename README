@@ -83,6 +83,12 @@ Design choices
    After a chargeback the account is locked and rejects every further
    transaction: deposits, withdrawals, disputes, resolves and chargebacks.
 
+   A frozen account cannot be unfrozen: the specification defines no
+   transaction that unlocks an account, so the lock is permanent. As a
+   consequence, funds of other deposits still under dispute when the account
+   is frozen stay held forever, since their resolve or chargeback is
+   rejected too.
+
 7. Failures create no accounts
 
    An account is created by its first successful deposit. A withdrawal from
