@@ -1,0 +1,123 @@
+exercise
+========
+
+Implementation of a transaction processor: it reads a CSV file of
+transactions, applies them to client accounts and writes the final balances
+as CSV.
+
+
+Usage
+-----
+
+    cargo run -- transactions.csv > accounts.csv
+
+The input file is the only argument. Balances are written to standard output,
+sorted by client id. A wrong argument count exits with code 2; an input file
+that cannot be opened or read, or a failure to write the output, exits with
+code 1.
+
+
+Layout
+------
+
+    src/amount.rs   Amount: fixed-point decimal with four places.
+    src/engine.rs   Engine: accounts, disputable deposits, transaction rules.
+    src/lib.rs      CSV input and output around the engine.
+    src/main.rs     Command line entry point; owns the engine state.
+    tests/cli.rs    End-to-end tests running the binary on tests/data/.
+
+
+Design choices
+--------------
+
+1. Amounts are integers
+
+   An amount is a u64 holding a number of ten-thousandths: 1.5 is stored as
+   15000. Arithmetic is exact, so there are no floating point rounding
+   errors. Every addition and subtraction is checked: an overflow or a
+   negative result is an error instead of a wrapped value. A u64 holds up to
+   about 1.8e15 units, far beyond any realistic balance.
+
+   Parsing is strict. It accepts "2", "2.", "2.5" and ".5" and rejects
+   negative values, signs, exponents, separators, more than four decimals and
+   values that do not fit. Output drops trailing zeros, so 1.5000 is written
+   "1.5" and 2.0000 is written "2".
+
+2. Every transaction is all or nothing
+
+   Each transaction is checked completely before any state changes. A
+   rejected transaction leaves the engine exactly as it was and returns a
+   TxError giving the reason (locked account, insufficient funds, unknown
+   transaction, ...). The binary ignores these errors, as the specification
+   asks, but the reasons make the engine easy to test and to debug.
+
+3. The total is derived, never stored
+
+   An account stores only available, held and locked. The total is computed
+   as available + held, so the three values can never disagree. A deposit is
+   accepted only if the new total fits in a u64; no other operation increases
+   the total, so computing it can never overflow.
+
+4. Only deposits are kept in memory, and only while disputable
+
+   The engine keeps two hash maps: client id -> account, and transaction id
+   -> deposit (client, amount, disputed flag). Withdrawals are not stored:
+   they cannot be disputed. A deposit is removed once its dispute is resolved
+   or charged back, so a deposit can be disputed at most once and memory only
+   holds what can still change state. Lookups are O(1).
+
+5. Rules for dispute, resolve and chargeback
+
+   - The referenced transaction must be a tracked deposit of the same client.
+     A reference to a deposit of another client is treated as unknown.
+   - A dispute is rejected if the deposited funds were already withdrawn,
+     since holding them would make the available funds negative.
+   - A dispute of a deposit already under dispute is rejected.
+   - A resolve or a chargeback of a deposit that is not under dispute is
+     rejected.
+
+6. A chargeback freezes the account
+
+   After a chargeback the account is locked and rejects every further
+   transaction: deposits, withdrawals, disputes, resolves and chargebacks.
+
+7. Failures create no accounts
+
+   An account is created by its first successful deposit. A withdrawal from
+   an unknown client fails without creating an empty account, so the output
+   only lists clients that really had funds.
+
+8. Input is streamed and bad rows are skipped
+
+   The CSV is read one row at a time into a single reused buffer, so memory
+   grows with the number of accounts and disputable deposits, not with the
+   size of the file. Columns are matched by header name, surrounding
+   whitespace is trimmed and the amount may be left out on dispute, resolve
+   and chargeback rows.
+
+   A row that cannot be understood is skipped and processing continues: an
+   unknown type, an invalid client or transaction id, a deposit or withdrawal
+   with a missing or invalid amount. A deposit reusing the id of a deposit
+   still tracked is also rejected. Only an I/O error stops processing.
+
+9. Readable code, one instantiation per function
+
+   The engine is free of any I/O, which keeps the rules in one place and lets
+   them be tested directly. main creates the Engine itself and passes it
+   explicitly to process (read the CSV) and then to write_accounts (print
+   the balances), so the state being worked on is always visible. The CSV functions take &mut dyn Read and
+   &mut dyn Write instead of generic parameters: there is a single compiled
+   copy of each, and coverage tools measure it as a whole.
+
+
+Tests
+-----
+
+    cargo test
+    cargo llvm-cov --summary-only
+
+The unit tests check each rule of the engine, including that rejected
+transactions leave the state unchanged, the amount parser and formatter, and
+the CSV handling (whitespace, missing columns, invalid rows, read and write
+errors). The tests in tests/cli.rs run the binary end to end. Coverage is
+100% of regions, functions and lines.
