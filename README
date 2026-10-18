@@ -12,9 +12,11 @@ Usage
     cargo run -- transactions.csv > accounts.csv
 
 The input file is the only argument. Balances are written to standard output,
-sorted by client id. A wrong argument count exits with code 2; an input file
-that cannot be opened or read, or a failure to write the output, exits with
-code 1.
+sorted by client id. On failure the program prints the error message on
+standard error and exits with the errno.h code of the error: for example
+ENOENT for a missing input file, EISDIR for a directory, EPIPE when the
+output is closed, and EINVAL for a wrong argument count. An error without an
+OS code exits with EIO.
 
 
 Layout

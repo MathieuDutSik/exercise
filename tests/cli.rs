@@ -9,6 +9,18 @@ fn run(args: &[&str]) -> Output {
         .expect("failed to run the binary")
 }
 
+/// Checks the run failed with the `errno` exit status and an error message
+/// containing `message`.
+fn assert_error(out: &Output, errno: libc::c_int, message: &str) {
+    assert_eq!(out.status.code(), Some(errno));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("error: ") && stderr.contains(message),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
 fn data(name: &str) -> String {
     format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))
 }
@@ -37,26 +49,31 @@ fn processes_disputes() {
 #[test]
 fn rejects_wrong_argument_count() {
     for args in [&[][..], &["a.csv", "b.csv"][..]] {
-        let out = run(args);
-        assert_eq!(out.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
-        assert!(out.stdout.is_empty());
+        assert_error(
+            &run(args),
+            libc::EINVAL,
+            "usage: payments-engine <transactions.csv>",
+        );
     }
 }
 
 #[test]
 fn reports_missing_file() {
-    let out = run(&["does/not/exist.csv"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("does/not/exist.csv"));
+    assert_error(
+        &run(&["does/not/exist.csv"]),
+        libc::ENOENT,
+        "No such file or directory",
+    );
 }
 
 #[test]
 fn reports_unreadable_file() {
     // Opening a directory succeeds on Unix, but reading it fails.
-    let out = run(&[env!("CARGO_MANIFEST_DIR")]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).starts_with("error:"));
+    assert_error(
+        &run(&[env!("CARGO_MANIFEST_DIR")]),
+        libc::EISDIR,
+        "Is a directory",
+    );
 }
 
 #[test]
@@ -69,7 +86,9 @@ fn reports_write_failure() {
         .spawn()
         .expect("failed to run the binary");
     drop(child.stdout.take());
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: standard output:"));
+    assert_error(
+        &child.wait_with_output().unwrap(),
+        libc::EPIPE,
+        "Broken pipe",
+    );
 }
